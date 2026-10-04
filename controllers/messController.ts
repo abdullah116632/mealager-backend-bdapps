@@ -1,0 +1,806 @@
+import type { Response } from "express";
+import { asc, eq, and, sql } from "drizzle-orm";
+import {
+  db,
+  messesTable,
+  consumersTable,
+  depositEntriesTable,
+  depositsTable,
+  mealControlHelperTable,
+  mealOptOutsTable,
+  mealsTable,
+  usersTable,
+  memberRequestsTable,
+  notificationsTable,
+} from "../db/dbConfig.js";
+import { deliverNotifications } from "../lib/notificationDelivery.js";
+import type { AuthedRequest } from "../middleware/auth.js";
+import {
+  sendExistingMemberAddedEmail,
+  sendWelcomeEmail,
+  sendInviteEmail,
+} from "../lib/email.js";
+import { getMessContext } from "../lib/mess-access.js";
+import { normalizeEmail } from "../utils/authUtils.js";
+import {
+  toPendingRequestResponse,
+  updateMemberRequestStatus,
+} from "../utils/memberRequestUtils.js";
+import { resolveMessAccess } from "../utils/messAccessUtils.js";
+import {
+  generateMessKey,
+  generateTemporaryPassword,
+  toMessResponse,
+} from "../utils/messUtils.js";
+import { parsePositiveInteger } from "../utils/numberUtils.js";
+import { hashPassword } from "../utils/passwordUtils.js";
+
+// POST /api/mess/create — user can create multiple messes
+export const createMess = async (req: AuthedRequest, res: Response) => {
+  const userId = req.auth!.userId;
+  const { name } = req.body ?? {};
+  if (!name?.trim()) {
+    res.status(400).json({ error: "Mess name is required" });
+    return;
+  }
+
+  const messKey = generateMessKey();
+  const [mess] = await db
+    .insert(messesTable)
+    .values({ name: name.trim(), messKey, adminUserId: userId })
+    .returning();
+
+  const [user] = await db
+    .select({ name: usersTable.name })
+    .from(usersTable)
+    .where(eq(usersTable.id, userId))
+    .limit(1);
+
+  await db.insert(consumersTable).values({
+    messId: mess.id,
+    name: user?.name ?? "Admin",
+    userId,
+    isAdmin: true,
+  });
+
+  res.json({ mess: toMessResponse(mess) });
+};
+
+// POST /api/v2/mess/create — creates a mess with its helper baseline
+export const createMessV2 = async (req: AuthedRequest, res: Response) => {
+  const userId = req.auth!.userId;
+  const { name } = req.body ?? {};
+  if (!name?.trim()) {
+    res.status(400).json({ error: "Mess name is required" });
+    return;
+  }
+
+  const result = await db.transaction(async (tx) => {
+    const messKey = generateMessKey();
+    const [mess] = await tx
+      .insert(messesTable)
+      .values({ name: name.trim(), messKey, adminUserId: userId })
+      .returning();
+
+    const [user] = await tx
+      .select({ name: usersTable.name })
+      .from(usersTable)
+      .where(eq(usersTable.id, userId))
+      .limit(1);
+
+    await tx.insert(consumersTable).values({
+      messId: mess.id,
+      name: user?.name ?? "Admin",
+      userId,
+      isAdmin: true,
+    });
+
+    await tx.insert(mealControlHelperTable).values({
+      messId: mess.id,
+      breakfastEnabled: true,
+      lunchEnabled: true,
+      dinnerEnabled: true,
+      breakfastOptOutStart: "04:00",
+      breakfastOptOutEnd: "08:00",
+      lunchOptOutStart: "08:00",
+      lunchOptOutEnd: "13:00",
+      dinnerOptOutStart: "13:00",
+      dinnerOptOutEnd: "17:00",
+    });
+
+    return mess;
+  });
+
+  res.json({ mess: toMessResponse(result) });
+};
+
+// POST /api/mess/join — user can join multiple messes; re-request after rejection
+export const joinMess = async (req: AuthedRequest, res: Response) => {
+  const userId = req.auth!.userId;
+  const { messKey } = req.body ?? {};
+  if (!messKey?.trim()) {
+    res.status(400).json({ error: "messKey is required" });
+    return;
+  }
+
+  const [mess] = await db
+    .select()
+    .from(messesTable)
+    .where(eq(messesTable.messKey, messKey.trim().toUpperCase()))
+    .limit(1);
+  if (!mess) {
+    res.status(404).json({ error: "Invalid mess key" });
+    return;
+  }
+
+  if (mess.adminUserId === userId) {
+    res.status(409).json({ error: "You are already the admin of this mess" });
+    return;
+  }
+
+  const [existingConsumer] = await db
+    .select({ id: consumersTable.id })
+    .from(consumersTable)
+    .where(
+      and(
+        eq(consumersTable.userId, userId),
+        eq(consumersTable.messId, mess.id),
+      ),
+    )
+    .limit(1);
+  if (existingConsumer) {
+    res.status(409).json({ error: "You are already a member of this mess" });
+    return;
+  }
+
+  const [user] = await db
+    .select({ name: usersTable.name })
+    .from(usersTable)
+    .where(eq(usersTable.id, userId))
+    .limit(1);
+
+  const [existingRequest] = await db
+    .select({ id: memberRequestsTable.id, status: memberRequestsTable.status })
+    .from(memberRequestsTable)
+    .where(
+      and(
+        eq(memberRequestsTable.messId, mess.id),
+        eq(memberRequestsTable.userId, userId),
+      ),
+    )
+    .limit(1);
+
+  if (existingRequest) {
+    if (existingRequest.status === "pending") {
+      res.json({
+        pendingRequest: toPendingRequestResponse(existingRequest.id, mess),
+      });
+      return;
+    }
+    // An accepted request can remain as history after a manager removes the
+    // consumer. Re-open that request instead of hitting the unique constraint,
+    // so the same account can request to join again.
+    if (
+      existingRequest.status === "rejected" ||
+      existingRequest.status === "accepted"
+    ) {
+      await updateMemberRequestStatus(existingRequest.id, "pending");
+      await createMemberRequestNotification({
+        messId: mess.id,
+        userId: mess.adminUserId,
+        requesterName: user?.name ?? "A member",
+      });
+      res.json({
+        pendingRequest: toPendingRequestResponse(existingRequest.id, mess),
+      });
+      return;
+    }
+  }
+
+  const [request] = await db
+    .insert(memberRequestsTable)
+    .values({
+      messId: mess.id,
+      userId,
+      name: user?.name ?? "Member",
+      status: "pending",
+    })
+    .returning();
+
+  await createMemberRequestNotification({
+    messId: mess.id,
+    userId: mess.adminUserId,
+    requesterName: user?.name ?? "A member",
+  });
+
+  res.json({
+    pendingRequest: toPendingRequestResponse(request.id, mess),
+  });
+};
+
+// GET /api/mess/member-requests?messId=X — admin only
+export const getMemberRequests = async (req: AuthedRequest, res: Response) => {
+  const userId = req.auth!.userId;
+  const access = await resolveMessAccess(userId, req.query.messId, {
+    adminOnly: true,
+    missingMessIdError: "messId query param is required",
+  });
+  if (!access.ok) {
+    res.status(access.status).json({ error: access.error });
+    return;
+  }
+  const { mess } = access;
+
+  const requests = await db
+    .select({
+      id: memberRequestsTable.id,
+      userId: memberRequestsTable.userId,
+      name: usersTable.name,
+      email: usersTable.email,
+      status: memberRequestsTable.status,
+      createdAt: memberRequestsTable.createdAt,
+    })
+    .from(memberRequestsTable)
+    .innerJoin(usersTable, eq(memberRequestsTable.userId, usersTable.id))
+    .where(
+      and(
+        eq(memberRequestsTable.messId, mess.id),
+        eq(memberRequestsTable.status, "pending"),
+      ),
+    );
+
+  res.json({ requests });
+};
+
+// POST /api/mess/member-requests/:id/accept — admin only
+export const acceptMemberRequest = async (
+  req: AuthedRequest,
+  res: Response,
+) => {
+  const userId = req.auth!.userId;
+  const requestId = parsePositiveInteger(req.params.id);
+  const [memberRequest] = requestId
+    ? await db
+        .select()
+        .from(memberRequestsTable)
+        .where(eq(memberRequestsTable.id, requestId))
+        .limit(1)
+    : [];
+  if (!memberRequest) {
+    res.status(404).json({ error: "Request not found" });
+    return;
+  }
+
+  const access = await resolveMessAccess(userId, memberRequest.messId, {
+    adminOnly: true,
+  });
+  if (!access.ok) {
+    res.status(access.status).json({ error: access.error });
+    return;
+  }
+  const { mess } = access;
+
+  if (memberRequest.status === "accepted") {
+    const [consumer] = await db
+      .select({ id: consumersTable.id, name: consumersTable.name })
+      .from(consumersTable)
+      .where(
+        and(
+          eq(consumersTable.messId, mess.id),
+          eq(consumersTable.userId, memberRequest.userId),
+        ),
+      )
+      .limit(1);
+    if (consumer) {
+      res.json({ consumer });
+      return;
+    }
+  }
+  if (memberRequest.status !== "pending") {
+    res.status(409).json({ error: "Request is no longer pending" });
+    return;
+  }
+
+  await updateMemberRequestStatus(memberRequest.id, "accepted");
+
+  const [consumer] = await db
+    .insert(consumersTable)
+    .values({
+      messId: mess.id,
+      name: memberRequest.name,
+      userId: memberRequest.userId,
+    })
+    .returning({ id: consumersTable.id, name: consumersTable.name });
+
+  const [notification] = await db
+    .insert(notificationsTable)
+    .values({
+      messId: mess.id,
+      userId: memberRequest.userId,
+      type: "member_request_accepted",
+      title: "Join request accepted",
+      body: `Your request to join ${mess.name} has been accepted.`,
+    })
+    .returning();
+  void deliverNotifications([notification]);
+
+  res.json({ consumer });
+};
+
+const createMemberRequestNotification = async ({
+  messId,
+  userId,
+  requesterName,
+}: {
+  messId: number;
+  userId: number;
+  requesterName: string;
+}) => {
+  const [notification] = await db
+    .insert(notificationsTable)
+    .values({
+      messId,
+      userId,
+      type: "member_request",
+      title: "New join request",
+      body: `${requesterName} wants to join your mess.`,
+    })
+    .returning();
+  void deliverNotifications([notification]);
+};
+
+// POST /api/mess/member-requests/:id/reject — admin only
+export const rejectMemberRequest = async (
+  req: AuthedRequest,
+  res: Response,
+) => {
+  const userId = req.auth!.userId;
+  const requestId = parsePositiveInteger(req.params.id);
+  const [memberRequest] = requestId
+    ? await db
+        .select()
+        .from(memberRequestsTable)
+        .where(eq(memberRequestsTable.id, requestId))
+        .limit(1)
+    : [];
+  if (!memberRequest) {
+    res.status(404).json({ error: "Request not found" });
+    return;
+  }
+
+  const access = await resolveMessAccess(userId, memberRequest.messId, {
+    adminOnly: true,
+  });
+  if (!access.ok) {
+    res.status(access.status).json({ error: access.error });
+    return;
+  }
+
+  if (memberRequest.status === "rejected") {
+    res.json({ success: true });
+    return;
+  }
+  if (memberRequest.status !== "pending") {
+    res.status(409).json({ error: "Request is no longer pending" });
+    return;
+  }
+
+  await updateMemberRequestStatus(memberRequest.id, "rejected");
+
+  res.json({ success: true });
+};
+
+// GET /api/mess/info?messId=X
+export const getMessInfo = async (req: AuthedRequest, res: Response) => {
+  const userId = req.auth!.userId;
+  const messId = parsePositiveInteger(req.query.messId);
+  if (!messId) {
+    res.status(400).json({ error: "messId query param is required" });
+    return;
+  }
+  const { mess, role } = await getMessContext(userId, messId);
+  if (!mess) {
+    res.json({ mess: null, role: null });
+    return;
+  }
+  res.json({
+    mess: toMessResponse(mess),
+    role,
+  });
+};
+
+// GET /api/mess/consumers?messId=X
+export const getConsumers = async (req: AuthedRequest, res: Response) => {
+  const userId = req.auth!.userId;
+  const access = await resolveMessAccess(userId, req.query.messId, {
+    missingMessIdError: "messId query param is required",
+  });
+  if (!access.ok) {
+    res.status(access.status).json({ error: access.error });
+    return;
+  }
+  const { mess } = access;
+  const consumers = await db
+    .select({
+      id: consumersTable.id,
+      name: sql<string>`coalesce(${usersTable.name}, ${consumersTable.name})`,
+      userId: consumersTable.userId,
+      isAdmin: consumersTable.isAdmin,
+      accountDeletedAt: consumersTable.accountDeletedAt,
+      email: usersTable.email,
+      mobileNumber: usersTable.mobileNumber,
+    })
+    .from(consumersTable)
+    .leftJoin(usersTable, eq(consumersTable.userId, usersTable.id))
+    .where(eq(consumersTable.messId, mess.id))
+    .orderBy(asc(consumersTable.createdAt), asc(consumersTable.id));
+  res.json({ consumers });
+};
+
+export const lookupConsumerUser = async (req: AuthedRequest, res: Response) => {
+  const userId = req.auth!.userId;
+  const access = await resolveMessAccess(userId, req.query.messId, {
+    adminOnly: true,
+    missingMessIdError: "messId query param is required",
+  });
+  if (!access.ok) {
+    res.status(access.status).json({ error: access.error });
+    return;
+  }
+
+  const rawEmail = req.query.email;
+  if (typeof rawEmail !== "string" || !rawEmail.trim()) {
+    res.status(400).json({ error: "Email is required" });
+    return;
+  }
+
+  const normalizedEmail = normalizeEmail(rawEmail);
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+    res.status(400).json({ error: "A valid email address is required" });
+    return;
+  }
+
+  const [user] = await db
+    .select({ name: usersTable.name })
+    .from(usersTable)
+    .where(eq(usersTable.email, normalizedEmail))
+    .limit(1);
+
+  res.json(user ? { exists: true, name: user.name } : { exists: false });
+};
+
+// POST /api/mess/consumers — admin only; body: { messId, name, email, mobileNumber }
+export const addConsumer = async (req: AuthedRequest, res: Response) => {
+  const userId = req.auth!.userId;
+  const { messId: messIdRaw, name, email, mobileNumber } = req.body ?? {};
+  const access = await resolveMessAccess(userId, messIdRaw, {
+    adminOnly: true,
+  });
+  if (!access.ok) {
+    res.status(access.status).json({ error: access.error });
+    return;
+  }
+  const { mess } = access;
+  if (!name?.trim()) {
+    res.status(400).json({ error: "Consumer name is required" });
+    return;
+  }
+  if (!email?.trim()) {
+    res
+      .status(400)
+      .json({ error: "Email is required to create a consumer account" });
+    return;
+  }
+
+  const requestedName = (name as string).trim();
+  const normalizedEmail = normalizeEmail(email as string);
+  const normalizedMobile = (mobileNumber as string | undefined)?.trim() || null;
+
+  if (normalizedMobile && normalizedMobile.length !== 11) {
+    res.status(400).json({ error: "Mobile number must be exactly 11 digits" });
+    return;
+  }
+
+  const [existingUser] = await db
+    .select({
+      id: usersTable.id,
+      name: usersTable.name,
+      mobileNumber: usersTable.mobileNumber,
+    })
+    .from(usersTable)
+    .where(eq(usersTable.email, normalizedEmail))
+    .limit(1);
+
+  if (existingUser) {
+    const [existingConsumer] = await db
+      .select({ id: consumersTable.id })
+      .from(consumersTable)
+      .where(
+        and(
+          eq(consumersTable.messId, mess.id),
+          eq(consumersTable.userId, existingUser.id),
+        ),
+      )
+      .limit(1);
+    if (existingConsumer) {
+      res
+        .status(409)
+        .json({ error: "This user is already a member of this mess" });
+      return;
+    }
+
+    const [consumer] = await db
+      .insert(consumersTable)
+      .values({
+        messId: mess.id,
+        name: existingUser.name,
+        userId: existingUser.id,
+      })
+      .returning({ id: consumersTable.id, name: consumersTable.name });
+
+    sendExistingMemberAddedEmail(
+      normalizedEmail,
+      existingUser.name,
+      mess.name,
+      mess.messKey,
+    ).catch((err: unknown) => {
+      req.log.error({ err }, "Failed to send added-to-mess email");
+    });
+
+    res.json({
+      consumer: {
+        ...consumer,
+        userId: existingUser.id,
+        email: normalizedEmail,
+        mobileNumber: existingUser.mobileNumber,
+        isAdmin: false,
+        accountDeletedAt: null,
+      },
+      invitationSent: true,
+    });
+    return;
+  }
+
+  const plainPassword = generateTemporaryPassword();
+  const passwordHash = await hashPassword(plainPassword);
+
+  const [newUser] = await db
+    .insert(usersTable)
+    .values({
+      email: normalizedEmail,
+      name: requestedName,
+      passwordHash,
+      mobileNumber: normalizedMobile,
+    })
+    .returning({ id: usersTable.id });
+
+  sendWelcomeEmail(
+    normalizedEmail,
+    requestedName,
+    mess.name,
+    plainPassword,
+  ).catch((err: unknown) => {
+    req.log.error({ err }, "Failed to send welcome email to new consumer");
+  });
+
+  const [consumer] = await db
+    .insert(consumersTable)
+    .values({ messId: mess.id, name: requestedName, userId: newUser.id })
+    .returning({ id: consumersTable.id, name: consumersTable.name });
+
+  res.json({
+    consumer: {
+      ...consumer,
+      userId: newUser.id,
+      email: normalizedEmail,
+      mobileNumber: normalizedMobile,
+      isAdmin: false,
+      accountDeletedAt: null,
+    },
+    invitationSent: false,
+  });
+};
+
+// DELETE /api/mess/consumers/:id?messId=X — admin only; cannot delete admin consumers
+export const deleteConsumer = async (req: AuthedRequest, res: Response) => {
+  const userId = req.auth!.userId;
+  const access = await resolveMessAccess(userId, req.query.messId, {
+    adminOnly: true,
+    missingMessIdError: "messId query param is required",
+  });
+  if (!access.ok) {
+    res.status(access.status).json({ error: access.error });
+    return;
+  }
+  const { mess } = access;
+  const consumerId = parsePositiveInteger(req.params.id);
+
+  if (!consumerId) {
+    res.status(404).json({ error: "Consumer not found" });
+    return;
+  }
+
+  const [target] = await db
+    .select({
+      id: consumersTable.id,
+      isAdmin: consumersTable.isAdmin,
+      userId: consumersTable.userId,
+      accountDeletedAt: consumersTable.accountDeletedAt,
+    })
+    .from(consumersTable)
+    .where(
+      and(
+        eq(consumersTable.id, consumerId),
+        eq(consumersTable.messId, mess.id),
+      ),
+    )
+    .limit(1);
+
+  if (!target) {
+    res.status(404).json({ error: "Consumer not found" });
+    return;
+  }
+  if (target.isAdmin) {
+    res.status(403).json({
+      error: "Admin members cannot be deleted. Remove their admin role first.",
+    });
+    return;
+  }
+  if (target.accountDeletedAt) {
+    res.status(409).json({
+      error:
+        "Deleted-account records are retained to preserve historical accounting.",
+    });
+    return;
+  }
+
+  await db.transaction(async (tx) => {
+    await tx
+      .delete(mealOptOutsTable)
+      .where(
+        and(
+          eq(mealOptOutsTable.consumerId, consumerId),
+          eq(mealOptOutsTable.messId, mess.id),
+        ),
+      );
+    await tx
+      .delete(depositEntriesTable)
+      .where(
+        and(
+          eq(depositEntriesTable.consumerId, consumerId),
+          eq(depositEntriesTable.messId, mess.id),
+        ),
+      );
+    await tx
+      .delete(depositsTable)
+      .where(
+        and(
+          eq(depositsTable.consumerId, consumerId),
+          eq(depositsTable.messId, mess.id),
+        ),
+      );
+    await tx
+      .delete(mealsTable)
+      .where(
+        and(
+          eq(mealsTable.consumerId, consumerId),
+          eq(mealsTable.messId, mess.id),
+        ),
+      );
+    await tx
+      .delete(consumersTable)
+      .where(
+        and(
+          eq(consumersTable.id, consumerId),
+          eq(consumersTable.messId, mess.id),
+        ),
+      );
+  });
+  res.json({ success: true });
+};
+
+// POST /api/mess/invite — admin sends mess join key to an email address
+export const inviteToMess = async (req: AuthedRequest, res: Response) => {
+  const userId = req.auth!.userId;
+  const { messId: messIdRaw, toEmail } = req.body ?? {};
+  const access = await resolveMessAccess(userId, messIdRaw, {
+    adminOnly: true,
+  });
+  if (!access.ok) {
+    res.status(access.status).json({ error: access.error });
+    return;
+  }
+  const { mess } = access;
+  if (!toEmail?.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(toEmail.trim())) {
+    res.status(400).json({ error: "A valid email address is required" });
+    return;
+  }
+  const [adminUser] = await db
+    .select({ name: usersTable.name })
+    .from(usersTable)
+    .where(eq(usersTable.id, userId))
+    .limit(1);
+
+  sendInviteEmail(
+    normalizeEmail(toEmail as string),
+    adminUser?.name ?? "Admin",
+    mess.name,
+    mess.messKey,
+  ).catch((err: unknown) => {
+    req.log.error({ err }, "Failed to send invite email");
+  });
+
+  res.json({ success: true });
+};
+
+// POST /api/mess/rejoin — re-request to join after rejection (no mess key needed)
+export const rejoinMess = async (req: AuthedRequest, res: Response) => {
+  const userId = req.auth!.userId;
+  const { requestId } = req.body ?? {};
+  if (!requestId) {
+    res.status(400).json({ error: "requestId is required" });
+    return;
+  }
+  const parsedRequestId = parsePositiveInteger(requestId);
+  if (!parsedRequestId) {
+    res.status(404).json({ error: "Rejected request not found" });
+    return;
+  }
+
+  const [existingRequest] = await db
+    .select()
+    .from(memberRequestsTable)
+    .where(
+      and(
+        eq(memberRequestsTable.id, parsedRequestId),
+        eq(memberRequestsTable.userId, userId),
+      ),
+    )
+    .limit(1);
+
+  if (!existingRequest || existingRequest.status === "accepted") {
+    res.status(404).json({ error: "Rejected request not found" });
+    return;
+  }
+
+  const [mess] = await db
+    .select({
+      id: messesTable.id,
+      name: messesTable.name,
+      adminUserId: messesTable.adminUserId,
+    })
+    .from(messesTable)
+    .where(eq(messesTable.id, existingRequest.messId))
+    .limit(1);
+
+  if (existingRequest.status === "pending") {
+    res.json({
+      request: toPendingRequestResponse(existingRequest.id, {
+        id: existingRequest.messId,
+        name: mess?.name ?? "Unknown Mess",
+      }),
+    });
+    return;
+  }
+
+  await updateMemberRequestStatus(existingRequest.id, "pending");
+  const [user] = await db
+    .select({ name: usersTable.name })
+    .from(usersTable)
+    .where(eq(usersTable.id, userId))
+    .limit(1);
+  if (mess) {
+    await createMemberRequestNotification({
+      messId: mess.id,
+      userId: mess.adminUserId,
+      requesterName: user?.name ?? "A member",
+    });
+  }
+
+  res.json({
+    request: toPendingRequestResponse(existingRequest.id, {
+      id: existingRequest.messId,
+      name: mess?.name ?? "Unknown Mess",
+    }),
+  });
+};

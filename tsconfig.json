@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": false,
+    "forceConsistentCasingInFileNames": true,
+    "types": ["node"]
+  },
+  "include": [
+    "app.ts",
+    "index.ts",
+    "controllers/**/*",
+    "routes/**/*",
+    "utils/**/*",
+    "lib/**/*",
+    "middleware/**/*",
+    "realtime/**/*",
+    "db/**/*",
+    "zod/**/*",
+    "drizzle.config.ts"
+  ]
+}

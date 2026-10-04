@@ -1,0 +1,32 @@
+import { Router, type IRouter } from "express";
+import healthRouter from "./healthRoute.js";
+import appVersionRouter from "./appVersionRoute.js";
+import authRouter from "./authRoute.js";
+import messRouter from "./messRoute.js";
+import dataRouter from "./dataRoute.js";
+import settingsRouter from "./settingsRoute.js";
+import settingsV2Router from "./settingsV2Route.js";
+import mealScheduleRouter from "./mealScheduleRoute.js";
+import depositEntriesRouter from "./depositEntriesRoute.js";
+import noticeRouter from "./noticeRoute.js";
+import bazarRouter from "./bazarRoute.js";
+import messageRouter from "./messageRoute.js";
+import consumerBreakdownNotificationRouter from "./consumerBreakdownNotificationRoute.js";
+
+const router: IRouter = Router();
+
+router.use(healthRouter);
+router.use(appVersionRouter);
+router.use(authRouter);
+router.use(messRouter);
+router.use(dataRouter);
+router.use(settingsRouter);
+router.use(settingsV2Router);
+router.use(mealScheduleRouter);
+router.use(depositEntriesRouter);
+router.use(noticeRouter);
+router.use(bazarRouter);
+router.use(messageRouter);
+router.use(consumerBreakdownNotificationRouter);
+
+export default router;

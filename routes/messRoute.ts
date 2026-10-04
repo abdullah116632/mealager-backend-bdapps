@@ -1,0 +1,44 @@
+import { Router } from "express";
+
+import {
+  acceptMemberRequest,
+  addConsumer,
+  createMess,
+  createMessV2,
+  deleteConsumer,
+  getConsumers,
+  getMemberRequests,
+  getMessInfo,
+  inviteToMess,
+  joinMess,
+  lookupConsumerUser,
+  rejoinMess,
+  rejectMemberRequest,
+} from "../controllers/messController.js";
+import { requireAuth } from "../middleware/auth.js";
+
+const router = Router();
+
+router.post("/mess/create", requireAuth, createMess);
+router.post("/v2/mess/create", requireAuth, createMessV2);
+router.post("/mess/join", requireAuth, joinMess);
+router.get("/mess/member-requests", requireAuth, getMemberRequests);
+router.post(
+  "/mess/member-requests/:id/accept",
+  requireAuth,
+  acceptMemberRequest,
+);
+router.post(
+  "/mess/member-requests/:id/reject",
+  requireAuth,
+  rejectMemberRequest,
+);
+router.get("/mess/info", requireAuth, getMessInfo);
+router.get("/mess/consumers", requireAuth, getConsumers);
+router.get("/mess/consumer-user", requireAuth, lookupConsumerUser);
+router.post("/mess/consumers", requireAuth, addConsumer);
+router.delete("/mess/consumers/:id", requireAuth, deleteConsumer);
+router.post("/mess/invite", requireAuth, inviteToMess);
+router.post("/mess/rejoin", requireAuth, rejoinMess);
+
+export default router;
